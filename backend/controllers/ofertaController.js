@@ -1,0 +1,846 @@
+const CreacionOferta = require('../models/CreacionOferta');
+const Instructor = require('../models/Instructor'); 
+const { generarFichaCaracterizacion } = require('../services/pdfGenerator');
+const fs = require('fs');
+const EstadoOferta = require('../models/EstadoOferta'); 
+const { exportarExcelOferta } = require('../services/exportarExcelOferta');
+
+const path = require('path');
+
+const crearOferta = async (req, res) => {
+  try {
+    const usuario = req.usuario;
+    
+    console.log('🚀 INICIO - Crear oferta');
+    console.log('Usuario autenticado:', {
+      id: usuario._id,
+      nombre: usuario.nombre
+    });
+
+    // ===== OBTENER MODO DEL BODY =====
+    const modo = req.body.modo;
+    console.log('📌 Modo recibido:', modo);
+    console.log('📌 Body completo:', req.body);
+
+    // Procesar archivos si existen
+    const archivos = {};
+    if (req.files) {
+      console.log('📁 Archivos recibidos:', Object.keys(req.files));
+      if (req.files.firma_digital_pdf) {
+        archivos.firma_digital_pdf = req.files.firma_digital_pdf[0].path;
+      }
+      if (req.files.carta_pdf) {
+        archivos.carta_pdf = req.files.carta_pdf[0].path;
+      }
+    }
+
+    // Generar link único para inscripciones
+    const uniqueCode = Math.random().toString(36).substring(2, 15) + 
+                      Math.random().toString(36).substring(2, 15);
+    const linkInscripciones = `/inscribirse/${uniqueCode}`;
+    console.log('🔗 Link generado:', linkInscripciones);
+
+    // ===== PROCESAR HORARIO DIAS DE FORMA SEGURA =====
+    let horarioDias = [];
+    if (req.body.horario_dias) {
+      try {
+        let rawDias = req.body.horario_dias;
+        if (Array.isArray(rawDias)) {
+          rawDias = rawDias.find(item => item) || '[]';
+        }
+        horarioDias = JSON.parse(rawDias);
+        console.log('📅 Días parseados:', horarioDias);
+      } catch (e) {
+        console.error('❌ Error parseando horario_dias:', req.body.horario_dias);
+        horarioDias = [];
+      }
+    }
+
+    // Verificar campos requeridos
+    console.log('🔍 Verificando campos:');
+    console.log('- programa_formacion:', req.body.programa_formacion);
+    console.log('- modalidad:', req.body.modalidad);
+    console.log('- tipo_programa:', req.body.tipo_programa);
+    console.log('- tipo_oferta:', req.body.tipo_oferta);
+    console.log('- empresa_solicitante:', req.body.empresa_solicitante);
+
+    // ===== NUEVO: Buscar el estado "pendiente" =====
+    console.log('🔍 Buscando estado "pendiente"...');
+    const estadoPendiente = await EstadoOferta.findOne({ codigo: 'pendiente' });
+    if (!estadoPendiente) {
+      throw new Error('No se encontró el estado "pendiente" en la base de datos. Ejecuta el script insertarEstados.js');
+    }
+    console.log('✅ Estado encontrado:', estadoPendiente.nombre);
+
+    // Crear la oferta principal
+    console.log('📝 Creando oferta...');
+    const nuevaOferta = new CreacionOferta({
+      programa_formacion: req.body.programa_formacion,
+      modalidad: req.body.modalidad,
+      tipo_programa: req.body.tipo_programa,
+      tipo_oferta: req.body.tipo_oferta,
+      cupo_maximo: parseInt(req.body.cupo_maximo),
+      ambiente: { nombre: req.body.ambiente_nombre },
+      fechas: {
+        inicio: req.body.fechas_inicio,
+        fin: req.body.fechas_fin
+      },
+      ubicacion: {
+        departamento: req.body.ubicacion_departamento,
+        municipio: req.body.ubicacion_municipio,
+        direccion: req.body.ubicacion_direccion
+      },
+      empresa_solicitante: req.body.empresa_solicitante && req.body.empresa_solicitante !== '' ? req.body.empresa_solicitante : null,
+      subsector_economico: { nombre: req.body.subsector_nombre },
+      programa_especial: req.body.programa_especial || null,
+      convenio: { nombre: req.body.convenio_nombre },
+      horario: {
+        hora_inicio: req.body.horario_hora_inicio,
+        hora_fin: req.body.horario_hora_fin,
+        dias: horarioDias
+      },
+      duracion_meses: parseInt(req.body.duracion_meses) || 12,
+      es_campesena: modo === 'campesena',
+      coordinador_asignado: usuario.coordinadorAsignado,
+      creado_por: usuario._id,
+      link_inscripciones: linkInscripciones,
+      firma_digital_pdf: archivos.firma_digital_pdf,
+      carta_pdf: archivos.carta_pdf,
+      estado: estadoPendiente._id 
+    });
+
+    console.log('💾 Guardando oferta...');
+    const ofertaGuardada = await nuevaOferta.save();
+    console.log('✅ Oferta guardada con ID:', ofertaGuardada._id);
+
+    // ===== SI ES CAMPESENA, GUARDAR INSTRUCTORES Y DATOS DE RESPALDO =====
+    if (modo === 'campesena' && req.body.instructores) {
+      console.log('📥 Instructores recibidos (raw):', req.body.instructores);
+      
+      const instructoresData = JSON.parse(req.body.instructores);
+      console.log('📥 Instructores parseados:', instructoresData.length);
+      
+      const instructoresPromises = instructoresData.map(async (instructor, idx) => {
+        console.log(`📝 Guardando instructor ${idx + 1}:`, instructor.nombre);
+        const nuevoInstructor = new Instructor({
+          oferta_id: ofertaGuardada._id,
+          tipo: instructor.tipo,
+          tipo_identificacion: instructor.tipo_identificacion,
+          identificacion: instructor.identificacion,
+          nombre: instructor.nombre,
+          correo: instructor.correo,
+          celular: instructor.celular,
+          programacion: instructor.programacion || []
+        });
+        return nuevoInstructor.save();
+      });
+      
+      await Promise.all(instructoresPromises);
+      console.log(`✅ ${instructoresData.length} instructores guardados`);
+      
+      // ===== GUARDAR DATOS DEL INSTRUCTOR TÉCNICO EN LA OFERTA =====
+      const instructorTecnico = instructoresData.find(inst => inst.tipo === 'Técnico');
+      if (instructorTecnico) {
+        ofertaGuardada.instructor_nombre = instructorTecnico.nombre;
+        ofertaGuardada.instructor_correo = instructorTecnico.correo;
+        ofertaGuardada.instructor_identificacion = instructorTecnico.identificacion;
+        ofertaGuardada.instructor_telefono = instructorTecnico.celular;
+        await ofertaGuardada.save();
+        console.log('✅ Datos del instructor técnico guardados en la oferta:', {
+          nombre: instructorTecnico.nombre,
+          correo: instructorTecnico.correo,
+          identificacion: instructorTecnico.identificacion
+        });
+      }
+    }
+
+    // Poblar la oferta para la respuesta
+    console.log('🔍 Poblando oferta...');
+    const ofertaPoblada = await CreacionOferta.findById(ofertaGuardada._id)
+      .populate('programa_formacion')
+      .populate('modalidad')
+      .populate('tipo_programa')
+      .populate('tipo_oferta')
+      .populate('ubicacion.municipio')
+      .populate('programa_especial')
+      .populate('creado_por', 'nombre apellido nombreUsuario')
+      .populate('empresa_solicitante', 'nombre nit')
+      .populate('coordinador_asignado', 'nombre');
+
+    // Generar PDF
+    try {
+      console.log('📄 Generando PDF...');
+      const pdfBuffer = await generarFichaCaracterizacion(ofertaPoblada);
+      const pdfPath = path.join(__dirname, '../uploads/fichas', `ficha-${ofertaGuardada._id}.pdf`);
+      const pdfDir = path.dirname(pdfPath);
+      
+      if (!fs.existsSync(pdfDir)) {
+        fs.mkdirSync(pdfDir, { recursive: true });
+      }
+      
+      fs.writeFileSync(pdfPath, pdfBuffer);
+      console.log(`✅ PDF generado: ${pdfPath}`);
+    } catch (pdfError) {
+      console.error('❌ Error generando PDF:', pdfError);
+    }
+
+    console.log('🎉 Oferta creada exitosamente');
+    res.status(201).json({
+      success: true,
+      message: 'Oferta creada correctamente',
+      data: ofertaPoblada,
+      archivos
+    });
+    
+  } catch (error) {
+    console.error('❌❌❌ ERROR DETALLADO ❌❌❌');
+    console.error('Nombre del error:', error.name);
+    console.error('Mensaje:', error.message);
+    console.error('Stack:', error.stack);
+    if (error.errors) {
+      console.error('Errores de validación:', Object.keys(error.errors).map(key => ({
+        campo: key,
+        mensaje: error.errors[key].message
+      })));
+    }
+    
+    if (error.name === 'ValidationError') {
+      const mensajes = Object.values(error.errors).map(err => err.message);
+      return res.status(400).json({
+        success: false,
+        message: 'Error de validación',
+        errors: mensajes
+      });
+    }
+    
+    res.status(500).json({
+      success: false,
+      message: 'Error al crear la oferta',
+      error: error.message
+    });
+  }
+};
+
+// Obtener todas las ofertas
+const obtenerOfertas = async (req, res) => {
+  try {
+    const ofertas = await CreacionOferta.find()
+      .populate('programa_formacion')
+      .populate('modalidad')
+      .populate('tipo_programa')
+      .populate('tipo_oferta')
+      .populate('ubicacion.municipio')
+      .populate('programa_especial')
+      .populate('estado')
+      .populate({
+        path: 'creado_por',
+        select: 'nombre apellido nombreUsuario numeroIdentificacion correoElectronico'
+      })
+      .populate({
+        path: 'empresa_solicitante',
+        select: 'nombre nit'
+      })
+      .populate('coordinador_asignado', 'nombre')
+      .select('+carta_pdf +firma_digital_pdf')
+      .sort({ createdAt: -1 });
+
+    res.json({
+      success: true,
+      count: ofertas.length,
+      data: ofertas
+    });
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error al obtener las ofertas',
+      error: error.message
+    });
+  }
+};
+
+const exportarExcelOfertaCompleta = async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const oferta = await CreacionOferta.findById(id)
+      .populate('programa_formacion')
+      .populate('tipo_oferta')
+      .populate('programa_especial')
+      .populate('empresa_solicitante')
+      .populate('ubicacion.municipio')
+      .populate('creado_por')
+      .populate('coordinador_asignado');
+    
+    if (!oferta) {
+      return res.status(404).json({ message: 'Oferta no encontrada' });
+    }
+
+    let instructores = [];
+    if (oferta.es_campesena) {
+      instructores = await Instructor.find({ oferta_id: oferta._id });
+    }
+
+    await exportarExcelOferta(oferta, instructores, res);
+
+  } catch (error) {
+    console.error('Error exportando Excel:', error);
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// Obtener una oferta por ID
+// backend/controllers/ofertaController.js
+// En la función obtenerOfertaPorId, asegúrate de popular estado_administrativo:
+
+const obtenerOfertaPorId = async (req, res) => {
+  try {
+    const oferta = await CreacionOferta.findById(req.params.id)
+      .populate('programa_formacion')
+      .populate('modalidad')
+      .populate('tipo_programa')
+      .populate('tipo_oferta')
+      .populate('ubicacion.municipio')
+      .populate('programa_especial')
+      .populate('estado')  // ✅ Para el estado general
+      .populate('estado_administrativo')  // ✅ IMPORTANTE: Para el estado administrativo
+      .populate({
+        path: 'creado_por',
+        select: 'nombre apellido nombreUsuario numeroIdentificacion correoElectronico'
+      })
+      .populate({
+        path: 'empresa_solicitante',
+        select: 'nombre nit'
+      })
+      .populate('coordinador_asignado', 'nombre');
+
+    if (!oferta) {
+      return res.status(404).json({
+        success: false,
+        message: 'Oferta no encontrada'
+      });
+    }
+
+    res.json({
+      success: true,
+      data: oferta
+    });
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error al obtener la oferta',
+      error: error.message
+    });
+  }
+};
+
+// Obtener ofertas del usuario actual
+// En obtenerMisOfertas, modifica el .select() para incluir comentario_rechazo
+// backend/controllers/ofertaController.js
+// En la función obtenerMisOfertas
+
+// backend/controllers/ofertaController.js
+const obtenerMisOfertas = async (req, res) => {
+  try {
+    const usuario = req.usuario;
+    
+    const ofertas = await CreacionOferta.find({ 
+      creado_por: usuario._id 
+    })
+      .populate('programa_formacion')
+      .populate('modalidad')
+      .populate('tipo_programa')
+      .populate('tipo_oferta')
+      .populate('ubicacion.municipio')
+      .populate('programa_especial')
+      .populate('estado')
+      .populate('estado_administrativo')  // ✅ AGREGAR ESTO
+      .populate({
+        path: 'empresa_solicitante',
+        select: 'nombre nit'
+      })
+      .populate('coordinador_asignado', 'nombre')
+      .select('+carta_pdf +firma_digital_pdf +comentario_rechazo')
+      .sort({ createdAt: -1 });
+
+    res.json({
+      success: true,
+      count: ofertas.length,
+      data: ofertas
+    });
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error al obtener tus ofertas',
+      error: error.message
+    });
+  }
+};
+
+// Buscar oferta por link de inscripción
+const getOfertaPorLink = async (req, res) => {
+  try {
+    const { codigo } = req.params;
+    const linkCompleto = `/inscribirse/${codigo}`;
+    
+    console.log('🔍 Buscando oferta con link:', linkCompleto);
+    
+    const oferta = await CreacionOferta.findOne({ link_inscripciones: linkCompleto })
+      .populate('programa_formacion')
+      .populate('modalidad')
+      .populate('ubicacion.municipio');
+
+    if (!oferta) {
+      return res.status(404).json({
+        success: false,
+        message: 'Link de inscripción no válido'
+      });
+    }
+
+    res.json({
+      success: true,
+      data: oferta
+    });
+  } catch (error) {
+    console.error('❌ Error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// =============================================
+// FUNCIONES PARA FUNCIONARIOS
+// =============================================
+
+// Obtener ofertas aprobadas según el tipo de funcionario
+const getOfertasAprobadasPorTipo = async (req, res) => {
+  try {
+    const { tipo } = req.params;
+    const funcionario = req.usuario;
+
+    const tieneAcceso = funcionario.modalidades?.some(m => 
+      m.nombre?.toLowerCase() === tipo || m.toString().includes(tipo)
+    );
+
+    if (!tieneAcceso && funcionario.tipo === 'funcionario') {
+      return res.status(403).json({
+        success: false,
+        message: 'No tienes permiso para ver ofertas de este tipo'
+      });
+    }
+
+    const estadoAprobada = await EstadoOferta.findOne({ codigo: 'aprobada' });
+    
+    if (!estadoAprobada) {
+      return res.status(404).json({
+        success: false,
+        message: 'Estado "aprobada" no encontrado'
+      });
+    }
+
+    const ofertas = await CreacionOferta.find({
+      estado: estadoAprobada._id,
+      es_campesena: tipo === 'campesena'
+    })
+      .populate('programa_formacion')
+      .populate('modalidad')
+      .populate('tipo_oferta')
+      .populate('ubicacion.municipio')
+      .populate('programa_especial')
+      .populate({
+        path: 'creado_por',
+        select: 'nombre apellido'
+      })
+      .populate({
+        path: 'empresa_solicitante',
+        select: 'nombre nit'
+      })
+      .populate('coordinador_asignado', 'nombre')
+      .select('+carta_pdf +firma_digital_pdf')
+      .sort({ createdAt: -1 });
+
+    const ofertasConFicha = ofertas.map(oferta => {
+      const ofertaObj = oferta.toObject();
+      ofertaObj.tieneFicha = !!oferta.ficha_sofia;
+      return ofertaObj;
+    });
+
+    res.json({
+      success: true,
+      count: ofertas.length,
+      data: ofertasConFicha
+    });
+
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// Registrar ficha de Sofía Plus
+const registrarFichaSofia = async (req, res) => {
+  try {
+    const { ofertaId } = req.params;
+    const { codigo_ficha, fecha_creacion, observaciones } = req.body;
+    const funcionario = req.usuario;
+
+    if (!codigo_ficha) {
+      return res.status(400).json({
+        success: false,
+        message: 'El código de ficha es obligatorio'
+      });
+    }
+
+    const oferta = await CreacionOferta.findById(ofertaId)
+      .populate('programa_formacion')
+      .populate('estado');
+
+    if (!oferta) {
+      return res.status(404).json({
+        success: false,
+        message: 'Oferta no encontrada'
+      });
+    }
+
+    if (oferta.estado?.codigo !== 'aprobada') {
+      return res.status(400).json({
+        success: false,
+        message: 'Solo se pueden registrar fichas para ofertas aprobadas'
+      });
+    }
+
+    const tipoOferta = oferta.es_campesena ? 'campesena' : 'regular';
+    const tieneAcceso = funcionario.modalidades?.some(m => 
+      m.nombre?.toLowerCase() === tipoOferta || m.toString().includes(tipoOferta)
+    );
+
+    if (!tieneAcceso && funcionario.tipo === 'funcionario') {
+      return res.status(403).json({
+        success: false,
+        message: 'No tienes permiso para registrar fichas de este tipo de oferta'
+      });
+    }
+
+    oferta.ficha_sofia = {
+      codigo: codigo_ficha,
+      creada_por: funcionario._id,
+      fecha_creacion: fecha_creacion || new Date(),
+      observaciones: observaciones || ''
+    };
+
+    const estadoFichaCreada = await EstadoOferta.findOne({ codigo: 'ficha_creada' });
+    if (estadoFichaCreada) {
+      oferta.estado = estadoFichaCreada._id;
+      
+      if (!oferta.historial_estados) oferta.historial_estados = [];
+      oferta.historial_estados.push({
+        estado: estadoFichaCreada._id,
+        comentario: `Ficha creada: ${codigo_ficha}`,
+        cambiado_por: funcionario._id,
+        cambiado_por_modelo: 'Funcionario',
+        fecha: new Date()
+      });
+    }
+
+    await oferta.save();
+
+    res.json({
+      success: true,
+      message: 'Ficha registrada exitosamente',
+      data: {
+        oferta_id: oferta._id,
+        codigo_ficha: oferta.ficha_sofia.codigo,
+        fecha_creacion: oferta.ficha_sofia.fecha_creacion,
+        estado: 'ficha_creada'
+      }
+    });
+
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// Obtener historial de fichas creadas por el funcionario
+const getHistorialFichas = async (req, res) => {
+  try {
+    const funcionario = req.usuario;
+
+    const ofertas = await CreacionOferta.find({
+      'ficha_sofia.creada_por': funcionario._id
+    })
+      .populate('programa_formacion', 'nombre_programa codigo')
+      .populate('creado_por', 'nombre apellido')
+      .select('ficha_sofia programa_formacion fechas creado_por')
+      .sort({ 'ficha_sofia.fecha_creacion': -1 });
+
+    const historial = ofertas.map(oferta => ({
+      oferta_id: oferta._id,
+      programa: oferta.programa_formacion?.nombre_programa,
+      codigo_programa: oferta.programa_formacion?.codigo,
+      codigo_ficha: oferta.ficha_sofia?.codigo,
+      fecha_creacion: oferta.ficha_sofia?.fecha_creacion,
+      instructor: oferta.creado_por ? `${oferta.creado_por.nombre} ${oferta.creado_por.apellido}` : 'N/A',
+      observaciones: oferta.ficha_sofia?.observaciones
+    }));
+
+    res.json({
+      success: true,
+      count: historial.length,
+      data: historial
+    });
+
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// =============================================
+// FUNCIONES PARA COORDINADOR - CORREGIDAS
+// =============================================
+
+// Obtener ofertas por coordinador (con todos los datos del instructor)
+const obtenerOfertasPorCoordinador = async (req, res) => {
+  try {
+    const { coordinadorId } = req.params;
+    
+    const ofertas = await CreacionOferta.find({ 
+      coordinador_asignado: coordinadorId 
+    })
+      .populate('programa_formacion')
+      .populate('modalidad')
+      .populate('tipo_programa')
+      .populate('tipo_oferta')
+      .populate('ubicacion.municipio')
+      .populate('programa_especial')
+      .populate('estado')
+      .populate({
+        path: 'creado_por',
+        select: 'nombre apellido nombreUsuario numeroIdentificacion correoElectronico telefono'
+      })
+      .populate({
+        path: 'empresa_solicitante',
+        select: 'nombre nit'
+      })
+      .populate('coordinador_asignado', 'nombre')
+      .select('+carta_pdf +firma_digital_pdf')
+      .sort({ createdAt: -1 });
+
+    res.json({
+      success: true,
+      count: ofertas.length,
+      data: ofertas
+    });
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error al obtener ofertas del coordinador',
+      error: error.message
+    });
+  }
+};
+
+// =============================================
+// DESCARGA DE PDF - CORREGIDA CON LOGS
+// =============================================
+
+const descargarPDF = async (req, res) => {
+  try {
+    console.log('🔍 === DESCARGA PDF COORDINADOR ===');
+    
+    const oferta = await CreacionOferta.findById(req.params.id)
+      .populate('programa_formacion')
+      .populate('modalidad')
+      .populate('tipo_programa')
+      .populate('tipo_oferta')
+      .populate('ubicacion.municipio')
+      .populate('programa_especial')
+      .populate({
+        path: 'creado_por',
+        select: 'nombre apellido nombreUsuario numeroIdentificacion correoElectronico telefono'
+      })
+      .populate({
+        path: 'empresa_solicitante',
+        select: 'nombre nit direccion fecha_creacion tipo_empresa numero_empleados'
+      })
+      .populate('coordinador_asignado', 'nombre');
+
+    if (!oferta) {
+      return res.status(404).json({
+        success: false,
+        message: 'Oferta no encontrada'
+      });
+    }
+
+    // === LOGS DETALLADOS ===
+    console.log('📄 ID Oferta:', oferta._id);
+    console.log('📄 es_campesena:', oferta.es_campesena);
+    console.log('📄 creado_por (ID):', oferta.creado_por?._id);
+    console.log('📄 creado_por (nombre):', oferta.creado_por?.nombre);
+    console.log('📄 creado_por (correo):', oferta.creado_por?.correoElectronico);
+    console.log('📄 creado_por (identificacion):', oferta.creado_por?.numeroIdentificacion);
+    console.log('📄 instructor_nombre:', oferta.instructor_nombre);
+    console.log('📄 instructor_correo:', oferta.instructor_correo);
+    console.log('📄 instructor_identificacion:', oferta.instructor_identificacion);
+
+    let ofertaParaPDF = oferta.toObject ? oferta.toObject() : oferta;
+    
+    if (oferta.es_campesena) {
+      const instructores = await Instructor.find({ oferta_id: oferta._id });
+      ofertaParaPDF.instructores = instructores;
+      console.log('📄 Instructores campesena encontrados:', instructores.length);
+      if (instructores.length > 0) {
+        console.log('📄 Primer instructor:', {
+          nombre: instructores[0].nombre,
+          correo: instructores[0].correo,
+          identificacion: instructores[0].identificacion,
+          tipo: instructores[0].tipo
+        });
+      }
+    }
+
+    const pdfBuffer = await generarFichaCaracterizacion(ofertaParaPDF);
+    
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename=ficha-${oferta._id}.pdf`);
+    res.send(pdfBuffer);
+
+  } catch (error) {
+    console.error('Error generando PDF:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error al generar el PDF',
+      error: error.message
+    });
+  }
+};
+
+// Actualizar una oferta
+const actualizarOferta = async (req, res) => {
+  try {
+    const ofertaActualizada = await CreacionOferta.findByIdAndUpdate(
+      req.params.id,
+      req.body,
+      { new: true, runValidators: true }
+    )
+      .populate('programa_formacion')
+      .populate('modalidad')
+      .populate('tipo_programa')
+      .populate('tipo_oferta')
+      .populate('ubicacion.municipio')
+      .populate('programa_especial')
+      .populate({
+        path: 'creado_por',
+        select: 'nombre apellido nombreUsuario'
+      })
+      .populate({
+        path: 'empresa_solicitante',
+        select: 'nombre nit'
+      })
+      .populate('coordinador_asignado', 'nombre');
+
+    if (!ofertaActualizada) {
+      return res.status(404).json({
+        success: false,
+        message: 'Oferta no encontrada'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Oferta actualizada correctamente',
+      data: ofertaActualizada
+    });
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(400).json({
+      success: false,
+      message: 'Error al actualizar la oferta',
+      error: error.message
+    });
+  }
+};
+
+// Descargar carta de la oferta
+const descargarCartaOferta = async (req, res) => {
+  try {
+    const oferta = await CreacionOferta.findById(req.params.id);
+    if (!oferta || !oferta.carta_pdf) {
+      return res.status(404).json({ success: false, message: 'Carta no encontrada' });
+    }
+    const filePath = oferta.carta_pdf;
+    if (fs.existsSync(filePath)) {
+      res.sendFile(filePath);
+    } else {
+      res.status(404).json({ success: false, message: 'Archivo no existe' });
+    }
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// Eliminar una oferta
+const eliminarOferta = async (req, res) => {
+  try {
+    const oferta = await CreacionOferta.findByIdAndDelete(req.params.id);
+
+    if (!oferta) {
+      return res.status(404).json({
+        success: false,
+        message: 'Oferta no encontrada'
+      });
+    }
+
+    await Instructor.deleteMany({ oferta_id: req.params.id });
+
+    const pdfPath = path.join(__dirname, '../uploads/fichas', `ficha-${req.params.id}.pdf`);
+    if (fs.existsSync(pdfPath)) {
+      fs.unlinkSync(pdfPath);
+    }
+
+    res.json({
+      success: true,
+      message: 'Oferta eliminada correctamente'
+    });
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error al eliminar la oferta',
+      error: error.message
+    });
+  }
+};
+
+// ✅ EXPORTACIÓN
+module.exports = {
+  crearOferta,
+  obtenerOfertas,
+  obtenerOfertaPorId,
+  obtenerMisOfertas,
+  obtenerOfertasPorCoordinador,
+  actualizarOferta,
+  eliminarOferta,
+  getOfertaPorLink,
+  descargarPDF,
+  getOfertasAprobadasPorTipo,
+  registrarFichaSofia,
+  getHistorialFichas,
+  exportarExcelOfertaCompleta,
+  descargarCartaOferta
+};

@@ -1,0 +1,66 @@
+const mongoose = require('mongoose');
+
+const funcionarioSchema = new mongoose.Schema({
+  nombre: {
+    type: String,
+    required: true,
+    trim: true
+  },
+  apellido: {
+    type: String,
+    required: true,
+    trim: true
+  },
+  numeroIdentificacion: {
+    type: String,
+    required: true,
+    unique: true,
+    trim: true
+  },
+  correoElectronico: {
+    type: String,
+    required: true,
+    unique: true,
+    trim: true,
+    lowercase: true
+  },
+  telefono: {
+    type: String,
+    required: true,
+    trim: true
+  },
+  password: {
+    type: String,
+    required: true
+  },
+  nombreUsuario: {
+    type: String,
+    required: true,
+    unique: true,
+    trim: true
+  },
+  // 🔥 Campo TIPO para diferenciar en el login
+  tipo: {
+    type: String,
+    default: 'funcionario',
+    enum: ['funcionario']  // Solo puede ser 'funcionario'
+  },
+  // 🔥 Relación con TipoPrograma (Campesena/Regular)
+  modalidades: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'TipoPrograma',
+    required: true
+  }],
+  activo: {
+    type: Boolean,
+    default: true
+  }
+}, {
+  timestamps: true
+});
+
+// Índice para búsquedas rápidas
+funcionarioSchema.index({ modalidades: 1 });
+funcionarioSchema.index({ tipo: 1 });  // Índice para el campo tipo
+
+module.exports = mongoose.model('Funcionario', funcionarioSchema);
